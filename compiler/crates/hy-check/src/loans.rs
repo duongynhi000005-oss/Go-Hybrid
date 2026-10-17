@@ -1179,6 +1179,39 @@ impl<'a> Checker<'a> {
             }
             _ => {}
         }
+        let needs_origin = self
+            .lookup_binding(st, name)
+            .map(|b| b.non_owned_origin.is_none() && self.shape_may_share(&b.shape))
+            .unwrap_or(false);
+        if needs_origin {
+            let mut inferred = self.non_owned_origin_of(st, name).map(|(o, via_share)| {
+                if via_share && !o.starts_with("a may-share peer of ") {
+                    format!("a may-share peer of {}", o)
+                } else {
+                    o
+                }
+            });
+            if inferred.is_none() {
+                let mut move_ops = Vec::new();
+                crate::model::collect_move_operands(value, &mut move_ops);
+                for (op, _) in move_ops {
+                    if let Expr::Ident { name: src, .. } = op {
+                        if let Some(origin) = self
+                            .lookup_binding(st, src)
+                            .and_then(|b| b.non_owned_origin.clone())
+                        {
+                            inferred = Some(origin);
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(origin) = inferred {
+                if let Some(nb) = st.env_lookup_mut(name) {
+                    nb.non_owned_origin = Some(origin);
+                }
+            }
+        }
     }
 
     /// Record O5.2 alias links for pointer borrows (`p := &stats`, `slot := &m[k]`)
@@ -1527,12 +1560,13 @@ impl<'a> Checker<'a> {
     fn const_write_root(&self, st: &FnState, p: &Place) -> Option<String> {
         match &p.kind {
             PlaceKind::Ident(name) => {
-                if self
-                    .lookup_binding(st, name)
-                    .filter(|b| b.immutable)
-                    .is_some()
-                {
-                    return Some(name.clone());
+                if let Some(b) = self.lookup_binding(st, name) {
+                    if b.immutable {
+                        return Some(name.clone());
+                    }
+                    if let Some(c) = self.binding_const_root(b) {
+                        return Some(c);
+                    }
                 }
                 // #123: a copy of a `const` (`alias := cells`, `let copy =
                 // cells`) points at the same backing storage, so writing
@@ -1545,12 +1579,13 @@ impl<'a> Checker<'a> {
                         continue;
                     }
                     if let Some(parent) = st.aliases.get(&n) {
-                        if self
-                            .lookup_binding(st, parent)
-                            .filter(|b| b.immutable)
-                            .is_some()
-                        {
-                            return Some(parent.clone());
+                        if let Some(b) = self.lookup_binding(st, parent) {
+                            if b.immutable {
+                                return Some(parent.clone());
+                            }
+                            if let Some(c) = self.binding_const_root(b) {
+                                return Some(c);
+                            }
                         }
                         stack.push(parent.clone());
                     }
@@ -1558,12 +1593,13 @@ impl<'a> Checker<'a> {
                         if seen.contains(&peer) {
                             continue;
                         }
-                        if self
-                            .lookup_binding(st, &peer)
-                            .filter(|b| b.immutable)
-                            .is_some()
-                        {
-                            return Some(peer);
+                        if let Some(b) = self.lookup_binding(st, &peer) {
+                            if b.immutable {
+                                return Some(peer);
+                            }
+                            if let Some(c) = self.binding_const_root(b) {
+                                return Some(c);
+                            }
                         }
                         stack.push(peer);
                     }
@@ -1711,6 +1747,15 @@ impl<'a> Checker<'a> {
         }
         let mut roots = Vec::new();
         collect_ref_roots(inner, &mut roots);
+        let mut move_ops = Vec::new();
+        crate::model::collect_move_operands(inner, &mut move_ops);
+        for (op, _) in move_ops {
+            if let Expr::Ident { name, .. } = op {
+                roots.push(name.clone());
+            } else if let Some(r) = op.root_ident() {
+                roots.push(r.to_string());
+            }
+        }
         if roots.is_empty() {
             if let Some(r) = inner.root_ident() {
                 roots.push(r.to_string());
@@ -2457,6 +2502,20 @@ impl<'a> Checker<'a> {
             managed_taint: false,
             moved: None,
             non_owned_origin,
+        }
+    }
+
+    pub(crate) fn binding_const_root(&self, b: &Binding) -> Option<String> {
+        if !self.shape_may_share(&b.shape) {
+            return None;
+        }
+        let origin = b.non_owned_origin.as_deref()?;
+        let rest = origin.split("`const ").nth(1)?;
+        let cname = rest.split('`').next()?;
+        if !cname.is_empty() {
+            Some(cname.to_string())
+        } else {
+            None
         }
     }
 }

@@ -2454,6 +2454,213 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_move_freezes_source_and_aliases_e3003() {
+        // A `move` nested inside a projection, index, slice, or call wrapper
+        // is skipped by `collect_ref_roots`, so `collect_move_operands` must
+        // recurse through those wrappers to freeze the moved binding and its
+        // alias/may-share group (O5.1 / O5.2) and enforce O5.4 on GC fields.
+        let r1 = check(
+            "struct box { m map[string]int }\n\
+             fn worker(x map[string]int, done chan int) {\n\
+               x[\"k\"] = 1\n\
+               done <- 1\n\
+             }\n\
+             fn main() {\n\
+               done := make(chan int, 1)\n\
+               m := map[string]int{\"k\": 0}\n\
+               t := box{m: move m}.m\n\
+               task worker(move t, done)\n\
+               m[\"k\"] = 2\n\
+               _ = <-done\n\
+             }",
+        );
+        assert_eq!(r1.verdict, Verdict::Reject, "{:?}", r1.diagnostics);
+        assert!(
+            r1.diagnostics.iter().any(|d| d.code == "HYB-E3003"),
+            "expected HYB-E3003 after wrapped field-projection move, got {:?}",
+            r1.diagnostics
+        );
+
+        let r2 = check(
+            "fn worker(x map[string]int, done chan int) {\n\
+               x[\"k\"] = 1\n\
+               done <- 1\n\
+             }\n\
+             fn main() {\n\
+               done := make(chan int, 1)\n\
+               m := map[string]int{\"k\": 0}\n\
+               m2 := m\n\
+               t := []map[string]int{move m}[0]\n\
+               task worker(move t, done)\n\
+               m2[\"k\"] = 2\n\
+               _ = <-done\n\
+             }",
+        );
+        assert_eq!(r2.verdict, Verdict::Reject, "{:?}", r2.diagnostics);
+        assert!(
+            r2.diagnostics.iter().any(|d| d.code == "HYB-E3003"),
+            "expected HYB-E3003 on alias after wrapped slice-index move, got {:?}",
+            r2.diagnostics
+        );
+
+        let r3 = check(
+            "fn worker(x []int, done chan int) {\n\
+               x[0] = 9\n\
+               done <- 1\n\
+             }\n\
+             fn main() {\n\
+               done := make(chan int, 1)\n\
+               s := []int{1, 2, 3}\n\
+               t := (move s)[0:2]\n\
+               task worker(move t, done)\n\
+               s[0] = 4\n\
+               _ = <-done\n\
+             }",
+        );
+        assert_eq!(r3.verdict, Verdict::Reject, "{:?}", r3.diagnostics);
+        assert!(
+            r3.diagnostics.iter().any(|d| d.code == "HYB-E3003"),
+            "expected HYB-E3003 after wrapped reslice move, got {:?}",
+            r3.diagnostics
+        );
+
+        let r4 = check(
+            "struct holder { data map[string]int }\n\
+             fn main() {\n\
+               s := holder{data: map[string]int{\"k\": 0}}\n\
+               t := holder{data: move s.data}.data\n\
+               _ = t\n\
+             }",
+        );
+        assert_eq!(r4.verdict, Verdict::Reject, "{:?}", r4.diagnostics);
+        assert!(
+            r4.diagnostics.iter().any(|d| d.code == "HYB-E3004"),
+            "expected HYB-E3004 on wrapped O5.4 GC field move, got {:?}",
+            r4.diagnostics
+        );
+    }
+
+    #[test]
+    fn wrapped_move_and_assign_rebind_preserve_non_owned_origin_e3004() {
+        // Moving a non-owned binding (or a may-share peer of one) through a
+        // composite literal, projection wrapper, or assignment rebind must
+        // preserve its non-owned origin so a subsequent boundary `move` still
+        // rejects with HYB-E3004 (O5.1 / O5.4).
+        let r1 = check(
+            "struct box { m map[string]int }\n\
+             fn worker(x map[string]int, done chan int) {\n\
+               x[\"k\"] = 1\n\
+               done <- 1\n\
+             }\n\
+             fn leak(p map[string]int, done chan int) {\n\
+               t := box{m: move p}.m\n\
+               task worker(move t, done)\n\
+             }\n\
+             fn main() {}",
+        );
+        assert_eq!(r1.verdict, Verdict::Reject, "{:?}", r1.diagnostics);
+        assert!(
+            r1.diagnostics.iter().any(|d| d.code == "HYB-E3004"),
+            "expected HYB-E3004 for wrapped move of parameter, got {:?}",
+            r1.diagnostics
+        );
+
+        let r2 = check(
+            "struct holder { m map[string]int }\n\
+             fn worker(h holder, done chan int) {\n\
+               h.m[\"k\"] = 1\n\
+               done <- 1\n\
+             }\n\
+             fn leak(p map[string]int, done chan int) {\n\
+               p2 := holder{m: p}\n\
+               var h = holder{m: map[string]int{\"x\": 0}}\n\
+               h = move p2\n\
+               task worker(move h, done)\n\
+             }\n\
+             fn main() {}",
+        );
+        assert_eq!(r2.verdict, Verdict::Reject, "{:?}", r2.diagnostics);
+        assert!(
+            r2.diagnostics.iter().any(|d| d.code == "HYB-E3004"),
+            "expected HYB-E3004 for assign-move of may-share peer of parameter, got {:?}",
+            r2.diagnostics
+        );
+
+        let r3 = check(
+            "struct holder { m map[string]int }\n\
+             fn worker(h holder, done chan int) {\n\
+               h.m[\"k\"] = 1\n\
+               done <- 1\n\
+             }\n\
+             fn main() {\n\
+               done := make(chan int, 1)\n\
+               m := map[string]int{\"k\": 0}\n\
+               f := fn() {\n\
+                 h2 := holder{m: m}\n\
+                 t := move h2\n\
+                 task worker(move t, done)\n\
+               }\n\
+               f()\n\
+               _ = <-done\n\
+             }",
+        );
+        assert_eq!(r3.verdict, Verdict::Reject, "{:?}", r3.diagnostics);
+        assert!(
+            r3.diagnostics.iter().any(|d| d.code == "HYB-E3004"),
+            "expected HYB-E3004 for closure move-define of may-share peer of capture, got {:?}",
+            r3.diagnostics
+        );
+    }
+
+    #[test]
+    fn move_of_const_composite_preserves_deep_immutability_e3006() {
+        // `t := move m`, `t = move m`, and `delete(move m, ...)` on a `const`
+        // composite still alias the const's backing storage at runtime and
+        // must reject mutation with HYB-E3006 (T22).
+        let r1 = check(
+            "const m = map[string]int{\"k\": 1}\n\
+             fn main() {\n\
+               t := move m\n\
+               t[\"k\"] = 99\n\
+             }",
+        );
+        assert_eq!(r1.verdict, Verdict::Reject, "{:?}", r1.diagnostics);
+        assert!(
+            r1.diagnostics.iter().any(|d| d.code == "HYB-E3006"),
+            "expected HYB-E3006 when writing through move-defined const composite, got {:?}",
+            r1.diagnostics
+        );
+
+        let r2 = check(
+            "const m = map[string]int{\"k\": 1}\n\
+             fn main() {\n\
+               var t = map[string]int{\"a\": 0}\n\
+               t = move m\n\
+               delete(t, \"k\")\n\
+             }",
+        );
+        assert_eq!(r2.verdict, Verdict::Reject, "{:?}", r2.diagnostics);
+        assert!(
+            r2.diagnostics.iter().any(|d| d.code == "HYB-E3006"),
+            "expected HYB-E3006 when deleting from move-assigned const composite, got {:?}",
+            r2.diagnostics
+        );
+
+        let r3 = check(
+            "const m = map[string]int{\"k\": 1}\n\
+             fn main() {\n\
+               delete(move m, \"k\")\n\
+             }",
+        );
+        assert_eq!(r3.verdict, Verdict::Reject, "{:?}", r3.diagnostics);
+        assert!(
+            r3.diagnostics.iter().any(|d| d.code == "HYB-E3006"),
+            "expected HYB-E3006 on delete(move const_map, ...), got {:?}",
+            r3.diagnostics
+        );
+    }
+
+    #[test]
     fn closure_select_arm_body_boundaries_and_recv_scope_are_checked() {
         // Inside a closure body (closures.rs), `Stmt::Select` must both walk
         // each arm's body for boundary statements (`task` / `send`) and scope

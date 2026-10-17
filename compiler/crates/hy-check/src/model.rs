@@ -606,14 +606,56 @@ pub(crate) fn collect_ref_roots(e: &Expr, out: &mut Vec<String>) {
 }
 
 /// Collect every `move <operand>` inside `e` (top-level or nested inside
-/// composite literals / parens) so nested moves freeze their binding and
-/// non-binding GC field moves trigger HYB-E3004 (O5.1 / O5.4).
+/// composite literals, projections, slices, calls, or parens) so nested moves
+/// freeze their binding and non-binding GC field moves trigger HYB-E3004
+/// (O5.1 / O5.4).
 pub(crate) fn collect_move_operands<'e>(e: &'e Expr, out: &mut Vec<(&'e Expr, Span)>) {
     match e {
         Expr::Move { operand, span } => {
-            out.push((unwrap_parens(operand), *span));
+            let inner = unwrap_parens(operand);
+            out.push((inner, *span));
+            if !matches!(inner, Expr::Ident { .. }) {
+                collect_move_operands(inner, out);
+            }
         }
         Expr::Paren { inner, .. } => collect_move_operands(inner, out),
+        Expr::Field { base, .. } => collect_move_operands(base, out),
+        Expr::Index { base, index, .. } => {
+            collect_move_operands(base, out);
+            collect_move_operands(index, out);
+        }
+        Expr::Slice { base, lo, hi, .. } => {
+            collect_move_operands(base, out);
+            if let Some(lo) = lo {
+                collect_move_operands(lo, out);
+            }
+            if let Some(hi) = hi {
+                collect_move_operands(hi, out);
+            }
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_move_operands(callee, out);
+            for a in args {
+                collect_move_operands(&a.value, out);
+            }
+        }
+        Expr::Try { operand, .. }
+        | Expr::Unary { operand, .. }
+        | Expr::AddrOf { operand, .. } => {
+            collect_move_operands(operand, out);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_move_operands(lhs, out);
+            collect_move_operands(rhs, out);
+        }
+        Expr::Receive { chan, .. } => collect_move_operands(chan, out),
+        Expr::Interp { parts, .. } => {
+            for p in parts {
+                if let hy_syntax::InterpPart::Expr(sub) = p {
+                    collect_move_operands(sub, out);
+                }
+            }
+        }
         Expr::StructLit { fields, .. } => {
             for f in fields {
                 collect_move_operands(&f.value, out);

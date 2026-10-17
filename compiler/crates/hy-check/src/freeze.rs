@@ -217,6 +217,13 @@ impl<'a> Checker<'a> {
         }
         members.sort();
         members.dedup();
+        let shared_origin = self.non_owned_origin_of(st, name).map(|(o, via_share)| {
+            if via_share {
+                format!("a may-share peer of {}", o)
+            } else {
+                o
+            }
+        });
         for m in &members {
             if let Some(b) = st.env_lookup_mut(m) {
                 b.moved = Some(MoveInfo {
@@ -224,6 +231,9 @@ impl<'a> Checker<'a> {
                     kind,
                     desc: desc.clone(),
                 });
+                if b.non_owned_origin.is_none() && !b.shape.is_sendable_by_type() {
+                    b.non_owned_origin = shared_origin.clone();
+                }
             } else if let Some(cb) = self.consts.get(m).cloned() {
                 if !cb.shape.is_sendable_by_type() {
                     let mut frozen = cb;
@@ -375,7 +385,13 @@ impl<'a> Checker<'a> {
         //     the situation moving the parameter itself is rejected for.
         //     Peers are scanned in sorted order for deterministic
         //     diagnostics.
-        let mut origin: Option<(String, bool)> = own.map(|o| (o, false));
+        let mut origin: Option<(String, bool)> = own.map(|o| {
+            if let Some(rest) = o.strip_prefix("a may-share peer of ") {
+                (rest.to_string(), true)
+            } else {
+                (o, false)
+            }
+        });
         if origin.is_none() {
             let mut all_peers = st.share_group(name);
             if root != name {
